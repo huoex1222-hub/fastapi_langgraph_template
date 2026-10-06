@@ -230,9 +230,10 @@ class TestOpenTelemetryProviderSetup:
             # Should still add processor for good target
             tracer_provider_instance = mock_deps["tp"].return_value
             mock_deps["bsp"].assert_called_with(good_exporter)
-            # SpanEnrichmentProcessor is added unconditionally + one BatchSpanProcessor
-            # for the good target → two calls total
-            assert tracer_provider_instance.add_span_processor.call_count == 2
+            # SpanEnrichmentProcessor + CodeLocationProcessor are added
+            # unconditionally + one BatchSpanProcessor for the good target
+            # → three calls total
+            assert tracer_provider_instance.add_span_processor.call_count == 3
 
     def test_setup_instruments_globally(self, mock_deps):
         """Test that global tracer and instrumentation are set."""

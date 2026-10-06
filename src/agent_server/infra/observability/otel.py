@@ -14,7 +14,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 
 from agent_server.config.settings import settings
 from agent_server.infra.observability.base import ObservabilityProvider
-from agent_server.infra.observability.span_enrichment import SpanEnrichmentProcessor
+from agent_server.infra.observability.span_enrichment import CodeLocationProcessor, SpanEnrichmentProcessor
 from agent_server.infra.observability.targets import (
     BaseOtelTarget,
     GenericOtelTarget,
@@ -99,6 +99,7 @@ class OpenTelemetryProvider(ObservabilityProvider):
 
         self._tracer_provider = TracerProvider(resource=resource)
         self._tracer_provider.add_span_processor(SpanEnrichmentProcessor())
+        self._tracer_provider.add_span_processor(CodeLocationProcessor())
         processors_count = 0
 
         # 2. Attach Exporters

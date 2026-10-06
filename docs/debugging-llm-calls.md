@@ -33,12 +33,27 @@ code.function: shop
 
 在 Langfuse 里点开 `shop` span → Metadata 面板 → 直接定位到那一行。
 
-实现：模型构造的那一刻，调用栈里正好有节点的帧，`shared/models.py::_stamp_code_location()`
-走一下栈（跳过 langchain 自己的帧）就拿到了。**只在 tracing 打开（有 recording span）时才走**，
-关掉观测时零开销。
+实现（踩了两个坑之后才定下来）：
 
-已知边界：纯路由节点（`route_after_*`）不构造模型，所以没有这个属性——但它们名字本身就能
-直接 grep 到（`def route_after_shop`）。
+1. 模型构造时，`shared/models.py::_caller_code_location()` 走栈拿到**调用者的帧**
+   （跳过 site-packages），写进 `set_span_code_location()` 的 **ContextVar**；
+2. span 开始时，`infra/observability/span_enrichment.py::CodeLocationProcessor` 读 ContextVar
+   并打属性。
+
+为什么不能直接走栈、也不能用 `get_current_span()`：
+
+- **节点体里没有"当前 span"**——openinference 不把 span 挂在 OTEL 上下文里，
+  `trace.get_current_span()` 在节点里返回 `span_id=0x0`；
+- **span 是在线程池的工作线程上创建的**——langchain 对 async 链路执行同步 callback 时走
+  `run_in_executor`，那个线程的栈里**没有业务代码的帧**（`threading.py` 就到底了）。
+  所以位置必须在"有帧的地方"（模型构造）捕获，靠 ContextVar 跨线程传递（langchain 提交
+  callback 时会复制上下文）。
+
+已知边界：
+
+- 图启动阶段的 span（`LangGraph`、节点自己的 span）创建于位置被写入之前，所以**没有**这个
+  属性——有它的是**每次 LLM 调用的 span**（也就是排查时真正要看的那层）；
+- 纯路由节点（`route_after_*`）不构造模型，自然没有该属性——但它们名字本身就能 grep 到。
 
 ## 坑（都踩过）
 

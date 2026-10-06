@@ -75,6 +75,49 @@ class SpanEnrichmentProcessor(SpanProcessor):
         return True
 
 
+_code_location: contextvars.ContextVar[tuple[str, int, str] | None] = contextvars.ContextVar(
+    "agent_server_code_location", default=None
+)
+
+
+def set_span_code_location(location: tuple[str, int, str] | None) -> None:
+    """Record (filepath, lineno, function) of the code that builds a model.
+
+    Spans are created on langchain's callback worker thread — its stack holds
+    no graph frames — so the location has to be captured where it exists (the
+    model loader, inside the node) and read back when a span starts.
+    """
+    _code_location.set(location)
+
+
+class CodeLocationProcessor(SpanProcessor):
+    """Points spans at the code behind them.
+
+    Trace UIs name spans after nodes and chains, which is not where the code
+    is. This stamps OTEL's code attributes (``code.filepath``, ``code.lineno``,
+    ``code.function``) from the location recorded by the model loader — see
+    :func:`set_span_code_location`.
+    """
+
+    def on_start(self, span: Span, parent_context: Context | None = None) -> None:
+        location = _code_location.get()
+        if location is None:
+            return
+        filepath, lineno, function = location
+        span.set_attribute("code.filepath", filepath)
+        span.set_attribute("code.lineno", lineno)
+        span.set_attribute("code.function", function)
+
+    def on_end(self, span: ReadableSpan) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return True
+
+
 def set_trace_context(
     *,
     user_id: str | None = None,

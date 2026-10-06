@@ -13,10 +13,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 
 from agent_server.infra.observability.span_enrichment import (
+    CodeLocationProcessor,
     SpanEnrichmentProcessor,
     _trace_attrs,
     make_run_trace_context,
     merge_run_metadata,
+    set_span_code_location,
     set_trace_context,
 )
 
@@ -570,3 +572,36 @@ class TestSpanEnrichmentEndToEnd:
             assert attrs["langfuse.session.id"] == "thread-1"
             assert attrs["langfuse.trace.name"] == "my_graph"
             assert attrs["langfuse.trace.metadata.run_id"] == "run-1"
+
+
+def test_code_location_processor_stamps_spans_from_the_context_var() -> None:
+    """The location comes from the context var, not a stack walk: spans are
+    created on langchain's callback thread, whose stack has no graph frames."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(CodeLocationProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    set_span_code_location(("graphs/shopping_agent/nodes.py", 52, "shop"))
+    with provider.get_tracer("test").start_as_current_span("probe"):
+        pass
+
+    attrs = dict(exporter.get_finished_spans()[0].attributes or {})
+    assert attrs == {
+        "code.filepath": "graphs/shopping_agent/nodes.py",
+        "code.lineno": 52,
+        "code.function": "shop",
+    }
+
+
+def test_code_location_processor_is_a_noop_without_a_location() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(CodeLocationProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+    set_span_code_location(None)
+    with provider.get_tracer("test").start_as_current_span("probe"):
+        pass
+
+    assert not (exporter.get_finished_spans()[0].attributes or {})

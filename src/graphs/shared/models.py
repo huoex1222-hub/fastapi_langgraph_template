@@ -12,7 +12,27 @@ from langchain.chat_models import init_chat_model
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.outputs import LLMResult
-from opentelemetry import trace
+
+from agent_server.infra.observability.span_enrichment import set_span_code_location
+
+_LIBRARY_PATH_MARKERS = ("site-packages", "/lib/", "/lib64/")
+_OWN_FILE = __file__.replace("\\", "/")
+
+
+def _caller_code_location() -> tuple[str, int, str] | None:
+    """Where the model is being built: (path relative to ``src/``, lineno, function).
+
+    Walks out of this module and out of site-packages — the first remaining
+    frame is the graph/domain code that asked for the model.
+    """
+    for frame in inspect.stack(context=0)[1:]:
+        path = frame.filename.replace("\\", "/")
+        if path == _OWN_FILE or any(marker in path.lower() for marker in _LIBRARY_PATH_MARKERS):
+            continue
+        parts = path.split("/src/", 1)
+        return (parts[1] if len(parts) == 2 else path), frame.lineno, frame.function
+    return None
+
 
 # Response headers worth keeping on the message. Each provider names its
 # per-call id differently; add more here as needed.
@@ -40,6 +60,19 @@ class _TrimResponseHeaders(AsyncCallbackHandler):
     """Callback form of :func:`_trim_response_headers` — attached at client
     construction so it survives ``bind_tools``/``with_structured_output``."""
 
+    async def on_llm_new_token(self, token: Any, *, chunk: Any = None, **kwargs: Any) -> None:
+        # Streaming: the provider's headers ride on the FIRST chunk (both its
+        # generation_info and its message's response_metadata), and the final
+        # message is a NEW object built by aggregating chunks — so on_llm_end's
+        # message is not the one the caller receives. Trim the chunk instead,
+        # before the caller folds it in.
+        for metadata in (
+            getattr(chunk, "generation_info", None),
+            getattr(getattr(chunk, "message", None), "response_metadata", None),
+        ):
+            if isinstance(metadata, dict):
+                _trim_response_headers(metadata)
+
     async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         for batch in response.generations:
             for generation in batch:
@@ -62,45 +95,12 @@ def _correlation_headers() -> dict[str, str]:
     return {name: str(value) for name, value in pairs if value}
 
 
-def _caller_code_location() -> tuple[str, int, str] | None:
-    """Where the model is being built: (filepath, lineno, function).
-
-    Walks out of this module and out of site-packages (langchain internals), so
-    the first remaining frame is the graph/domain code that asked for the model.
-    """
-    for frame in inspect.stack(context=0)[1:]:
-        path = frame.filename.replace("\\", "/")
-        if "site-packages" in path or path.endswith("/shared/models.py"):
-            continue
-        parts = path.split("/src/", 1)
-        return (parts[1] if len(parts) == 2 else path), frame.lineno, frame.function
-    return None
-
-
-def _stamp_code_location() -> None:
-    """Point the current span at the code that built this model.
-
-    Trace UIs name spans after nodes ("shop", "classify"), which is not where
-    the code is. Stamping the OTel code attributes turns each node span into a
-    location — ``code.filepath: graphs/shopping_agent/nodes.py:52 (shop)`` — so
-    the trace jumps straight to the line. The stack walk is skipped unless a
-    recording span is active, i.e. tracing is on.
-    """
-    span = trace.get_current_span()
-    if not span.is_recording():
-        return
-    location = _caller_code_location()
-    if location is None:
-        return
-    filepath, lineno, function = location
-    span.set_attribute("code.filepath", filepath)
-    span.set_attribute("code.lineno", lineno)
-    span.set_attribute("code.function", function)
-
-
 def _client_kwargs(extra_body: dict[str, Any] | None) -> dict[str, Any]:
     """Per-client request options shared by every loader."""
-    _stamp_code_location()
+    # Hand the code location to the span processor while the node frame is
+    # still here: spans are created on langchain's callback thread, where the
+    # graph stack is gone.
+    set_span_code_location(_caller_code_location())
     kwargs: dict[str, Any] = {}
     if extra_body is not None:
         kwargs["extra_body"] = extra_body

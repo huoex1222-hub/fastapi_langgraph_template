@@ -93,10 +93,37 @@ def test_caller_code_location_points_at_the_calling_module() -> None:
     assert lineno > 0
 
 
-def test_stamp_code_location_is_a_noop_without_an_active_span() -> None:
-    """No recording span (tracing off) — must not raise, and must not pay for
-    the stack walk."""
-    m._stamp_code_location()
+def test_client_kwargs_publish_the_code_location() -> None:
+    """The span processor runs on langchain's callback thread, where the graph
+    stack is gone — the loader has to leave the location behind in the context."""
+    from agent_server.infra.observability.span_enrichment import _code_location
+
+    m._client_kwargs(None)
+    location = _code_location.get()
+    assert location is not None
+    path, _, function = location
+    assert path.endswith("test_models_fallback.py")
+    assert function == "test_client_kwargs_publish_the_code_location"
+
+
+def test_caller_code_location_is_not_kept_here() -> None:
+    """Code location moved to the OTEL span processor: inside a LangGraph node
+    no span is "current", so stamping from the client could never work."""
+    assert not hasattr(m, "_stamp_code_location")
+
+
+async def test_trim_applies_to_streaming_chunks() -> None:
+    """Streaming puts the captured headers on the FIRST chunk's generation_info,
+    which the aggregation folds into a fresh final message — end-only trimming
+    would silently keep all headers on every streamed call."""
+
+    class _Chunk:
+        def __init__(self, generation_info: dict) -> None:
+            self.generation_info = generation_info
+
+    chunk = _Chunk({"headers": {"x-ds-trace-id": "abc", "server": "openresty"}})
+    await m._TrimResponseHeaders().on_llm_new_token("tok", chunk=chunk)
+    assert chunk.generation_info == {"headers": {"x-ds-trace-id": "abc"}}
 
 
 def test_extra_body_reaches_every_model_in_the_chain(monkeypatch) -> None:
