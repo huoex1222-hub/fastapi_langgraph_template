@@ -19,7 +19,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.config import get_stream_writer
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from shared.fencing import SHARED_FENCE
 from shared.tooling import tool_blocked, tool_error, tool_ok
@@ -100,6 +100,27 @@ async def validate_and_enrich(
     return await spec.enrich(payload, context)
 
 
+def _tool_args_schema(payload_model: type[PresentationPayload]) -> type[BaseModel]:
+    """Args schema for a presentation tool.
+
+    langchain treats a pydantic schema with no fields as "a tool that takes no
+    arguments" and then invokes the function with *nothing* — not even the
+    state and tool_call_id LangGraph injects — so a field-less component (the
+    checkout summary is assembled server-side) dies with "missing 2 required
+    positional arguments". Merging the injected parameters into the schema
+    keeps the normal invocation path; langchain still strips them from the
+    model-facing schema, so the model keeps seeing a no-argument tool.
+    """
+    if payload_model.model_fields:
+        return payload_model
+    return create_model(
+        f"{payload_model.__name__}WithInjected",
+        __base__=payload_model,
+        state=(Annotated[Any, InjectedState], ...),
+        tool_call_id=(Annotated[str, InjectedToolCallId], ...),
+    )
+
+
 def make_presentation_tool(
     spec: PresentationComponent,
     *,
@@ -108,7 +129,7 @@ def make_presentation_tool(
 ) -> Any:
     """Build a presentation tool: validate → enrich → state write + ui event."""
 
-    @tool(spec.name, description=description, args_schema=spec.payload_model)
+    @tool(spec.name, description=description, args_schema=_tool_args_schema(spec.payload_model))
     async def present(
         state: Annotated[Any, InjectedState],
         config: RunnableConfig,
