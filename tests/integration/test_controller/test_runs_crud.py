@@ -783,24 +783,43 @@ class TestWaitForRun:
         # Should accept command parameter
         assert resp.status_code != 422
 
-    def test_wait_for_run_cannot_have_both_input_and_command(self):
-        """Test wait endpoint rejects both input and command"""
+    def test_wait_for_run_accepts_input_beside_command(self):
+        """input + command is accepted, and treated as a resume (command wins).
+
+        The bundled AG-UI frontend always sends both when resuming an interrupt
+        (its ``input`` carries the conversation state, the ``command`` carries
+        the resume value) — rejecting the pair failed every human-in-the-loop
+        approval with a 422 before the graph could resume.
+        """
         app = create_test_app(include_runs=True, include_threads=False)
 
-        override_session_dependency(app, BasicSession)
+        thread = _thread_row(status="idle")  # not interrupted
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt):
+                return thread
+
+        override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.post(
-            "/threads/test-thread-123/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"message": "test"},
-                "command": {"resume": "value"},
-            },
-        )
+        maker = _make_session_maker(Session())
+        with (
+            patch("agent_server.controller.http.routers.runs._get_session_maker", return_value=maker),
+            patch("agent_server.usecase.execution.run_preparation._get_session_maker", return_value=maker),
+            patch("agent_server.usecase.execution.run_preparation._RESUME_SETTLE_ATTEMPTS", 1),
+            patch("agent_server.usecase.execution.run_preparation._RESUME_SETTLE_INTERVAL_SECONDS", 0),
+        ):
+            resp = client.post(
+                "/threads/test-thread-123/runs/wait",
+                json={
+                    "assistant_id": "asst-123",
+                    "input": {"message": "test"},
+                    "command": {"resume": "value"},
+                },
+            )
 
-        # Should reject having both
-        assert resp.status_code == 422
+        # The resume path ran (idle thread → 400) instead of a 422 rejection.
+        assert resp.status_code == 400
 
     def test_wait_for_run_resume_requires_interrupted_thread(self):
         """Test wait endpoint with resume command requires interrupted thread"""

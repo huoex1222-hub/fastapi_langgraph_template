@@ -149,12 +149,14 @@ class RunCreate(BaseModel):
     @model_validator(mode="after")
     def validate_input_command_exclusivity(self) -> Self:
         """Ensure input and command are mutually exclusive."""
-        # Empty input dict alongside command: drop it for frontend compatibility.
+        # Command wins over input: when resuming an interrupt the AG-UI client
+        # (the bundled demo frontend) always sends both — its ``input`` carries
+        # the conversation state, its ``command`` carries the resume value. The
+        # graph resumes from its checkpoint, so the input is never used;
+        # dropping it beats rejecting a resume the client cannot express
+        # otherwise.
         if self.input is not None and self.command is not None:
-            if self.input == {}:
-                self.input = None
-            else:
-                raise ValueError("Cannot specify both 'input' and 'command' - they are mutually exclusive")
+            self.input = None
         # Checkpoint-only resume keeps input=None so Pregel resumes from next=[...]
         # instead of restarting from __start__ with an empty input.
         has_checkpoint = self.checkpoint is not None or self.checkpoint_id is not None

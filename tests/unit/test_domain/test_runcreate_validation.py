@@ -29,6 +29,25 @@ class TestRunCreateValidation:
         assert run_create.command is None
         assert run_create.checkpoint == {"checkpoint_id": "chk-1", "checkpoint_ns": ""}
 
+    def test_input_beside_command_is_dropped(self):
+        """Resuming an interrupt: the AG-UI client sends input *and* command in
+        one payload (input carries the conversation state). Rejecting it made
+        every human-in-the-loop approval fail with a 422 before the graph ran."""
+        run_create = RunCreate(
+            assistant_id="agent",
+            input={"messages": [{"role": "user", "content": "hi"}]},
+            command={"resume": True},
+        )
+
+        assert run_create.input is None
+        assert run_create.command == {"resume": True}
+
+    def test_empty_input_beside_command_is_dropped(self):
+        run_create = RunCreate(assistant_id="agent", input={}, command={"resume": "go"})
+
+        assert run_create.input is None
+        assert run_create.command == {"resume": "go"}
+
     def test_rejects_payload_without_input_command_or_checkpoint(self):
         """Ensure payloads with no input, command, or checkpoint are rejected."""
         with pytest.raises(ValueError, match="Must specify at least one of 'input', 'command', or 'checkpoint'"):

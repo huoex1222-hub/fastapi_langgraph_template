@@ -96,21 +96,37 @@ class TestStatelessWaitForRun:
         resp = client.post("/runs/wait", json={"assistant_id": "asst-123"})
         assert resp.status_code == 422
 
-    def test_validation_error_both_input_and_command(self) -> None:
-        """Providing both input and command → 422."""
+    def test_input_beside_command_is_accepted(self) -> None:
+        """input + command is accepted (command wins) — the AG-UI resume payload."""
         app = create_test_app(include_runs=True, include_threads=False)
-        override_session_dependency(app, BasicSession)
+
+        class Session(DummySessionBase):
+            async def scalar(self, _stmt: object) -> None:
+                return None
+
+        mock_maker = _make_session_maker(Session())
+
+        override_session_dependency(app, Session)
         client = make_client(app)
 
-        resp = client.post(
-            "/runs/wait",
-            json={
-                "assistant_id": "asst-123",
-                "input": {"msg": "hi"},
-                "command": {"resume": "value"},
-            },
-        )
-        assert resp.status_code == 422
+        with (
+            patch("agent_server.controller.http.routers.runs._get_session_maker", return_value=mock_maker),
+            patch("agent_server.usecase.execution.run_preparation.get_langgraph_service") as mock_service,
+            patch("agent_server.controller.http.routers.stateless_runs.delete_thread_by_id", new_callable=AsyncMock),
+        ):
+            mock_service.return_value.list_graphs.return_value = ["test-graph"]
+
+            resp = client.post(
+                "/runs/wait",
+                json={
+                    "assistant_id": "nonexistent",
+                    "input": {"msg": "hi"},
+                    "command": {"resume": "value"},
+                },
+            )
+
+        # Validation passes; the request proceeds to assistant lookup (404).
+        assert resp.status_code == 404
 
     def test_assistant_not_found(self) -> None:
         """Non-existent assistant → 404."""
