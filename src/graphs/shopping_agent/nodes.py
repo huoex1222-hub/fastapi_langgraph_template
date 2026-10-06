@@ -1,11 +1,11 @@
 """Node functions. Factories close over what a node needs."""
 
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.runtime import Runtime
 from pydantic import BaseModel
@@ -39,13 +39,41 @@ class IntentResult(BaseModel):
     intent: Literal["shop", "policy", "order", "chat"]
 
 
+def _classify_history(messages: Sequence[AnyMessage]) -> list[AnyMessage]:
+    """Text-only turns for the classifier.
+
+    This endpoint does not strictly enforce ``tool_choice``: given a history
+    that still contains earlier tool calls, the model mimics one of them
+    (``search_products``) instead of the forced ``IntentResult``, and the
+    structured-output parser then fails with "Unknown tool type". Tool results
+    must be dropped along with them — a tool message orphaned from its call is
+    an invalid request.
+    """
+    history: list[AnyMessage] = []
+    for message in messages:
+        if isinstance(message, ToolMessage):
+            continue
+        if isinstance(message, AIMessage) and message.tool_calls:
+            if not message.content:
+                continue
+            message = message.model_copy(update={"tool_calls": []})
+        history.append(message)
+    return history
+
+
 async def classify(state: State, runtime: Runtime[Context]) -> dict[str, Any]:
     """Classify the latest user message into a routing intent."""
+    # method="function_calling" forces tool_choice=<fn name>. This endpoint's
+    # reasoning ("thinking") mode rejects any forced tool_choice with a 400, so
+    # reasoning is disabled for this call only — the rest of the graph keeps it.
     classifier = load_chat_model_with_fallbacks(
-        runtime.context.model, runtime.context.fallback_models
-    ).with_structured_output(IntentResult)
+        runtime.context.model,
+        runtime.context.fallback_models,
+        extra_body={"reasoning_effort": "none"},
+    ).with_structured_output(IntentResult, method="function_calling")
+    messages = [SystemMessage(CLASSIFY_PROMPT), *_classify_history(state.messages)]
     # with_structured_output's stub return is dict|BaseModel; the contract is IntentResult.
-    result = cast("IntentResult", await classifier.ainvoke([SystemMessage(CLASSIFY_PROMPT), *state.messages]))
+    result = cast("IntentResult", await classifier.ainvoke(messages))
     return {"intent": result.intent}
 
 
