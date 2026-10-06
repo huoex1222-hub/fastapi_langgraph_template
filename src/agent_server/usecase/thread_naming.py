@@ -16,7 +16,7 @@ import asyncio
 from typing import cast
 
 import structlog
-from sqlalchemy import CursorResult, update
+from sqlalchemy import CursorResult, func, update
 
 from agent_server.config.settings import settings
 from agent_server.repo.orm import Thread as ThreadORM
@@ -71,7 +71,10 @@ async def maybe_name_thread(thread_id: str, input_data) -> None:
             update(ThreadORM)
             .where(
                 ThreadORM.thread_id == thread_id,
-                ~ThreadORM.metadata_json.has_key("naming_claimed"),  # noqa: W601
+                # jsonb_exists(), not has_key(): has_key() binds its key with the
+                # column's own type, generating `jsonb ? $1::JSONB` — and Postgres
+                # has no `jsonb ? jsonb` operator.
+                ~func.jsonb_exists(ThreadORM.metadata_json, "naming_claimed"),
             )
             .values(metadata_json=ThreadORM.metadata_json.op("||")({"naming_claimed": True, "title": placeholder}))
         )
