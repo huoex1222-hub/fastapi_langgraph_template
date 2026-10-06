@@ -47,7 +47,10 @@ class State(InputState):
 class Context:
     """Per-run configuration (override via the run's context parameter)."""
 
-    model: str = "openai/gpt-4o-mini"
+    # Provider stays "openai": DeepSeek speaks the OpenAI protocol, real endpoint
+    # comes from OPENAI_BASE_URL. Frontend runs send no context, so this default
+    # is what the browser actually hits.
+    model: str = "openai/deepseek-flash"
     # Circular fallback chain (provider/model strings); empty = no fallback.
     fallback_models: list[str] = field(default_factory=list)
     max_quantity_per_line: int = 5

@@ -37,7 +37,8 @@ from shared.middleware.skill_router import LLMSkillSelector, SkillRouterMiddlewa
 from shared.sandbox import make_sandbox_backend
 from shared.tools.web_search import web_search
 
-DEFAULT_MODEL = "openai:gpt-4o-mini"
+# Provider stays "openai" — DeepSeek speaks the OpenAI protocol, endpoint from OPENAI_BASE_URL.
+DEFAULT_MODEL = "openai:deepseek-flash"
 
 
 class ResearchAgentState(DeepAgentState):

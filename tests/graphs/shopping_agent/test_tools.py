@@ -113,7 +113,7 @@ def test_tools_expose_nine_contracts(harness) -> None:
 
 def test_context_defaults() -> None:
     ctx = Context()
-    assert ctx.model == "openai/gpt-4o-mini"
+    assert ctx.model == "openai/deepseek-flash"
     assert ctx.max_quantity_per_line == 5
 
 
