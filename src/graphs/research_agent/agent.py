@@ -24,6 +24,7 @@ from deepagents import DeepAgentState, create_deep_agent
 from deepagents.backends.composite import CompositeBackend
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.state import StateBackend
+from deepagents.profiles.provider.provider_profiles import apply_provider_profile
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
@@ -34,6 +35,7 @@ from research_agent.subagents import SUBAGENTS
 from research_agent.tools import make_plan_tool, think_tool
 from shared.middleware.audit_log import AuditLogMiddleware
 from shared.middleware.skill_router import LLMSkillSelector, SkillRouterMiddleware
+from shared.models import load_chat_model
 from shared.sandbox import make_sandbox_backend
 from shared.tools.web_search import web_search
 
@@ -67,6 +69,14 @@ def build_backend() -> CompositeBackend:
 
 def build_research_agent(mcp_tools: Sequence[BaseTool] = (), model: str = DEFAULT_MODEL) -> CompiledStateGraph:
     backend = build_backend()
+    # Build the client here instead of handing deepagents the string: its own
+    # `resolve_model` calls `init_chat_model` directly, bypassing shared/models.py
+    # and dropping every per-client option (include_response_headers — the
+    # x-ds-trace-id correlation key — plus the x-run-id/x-thread-id headers and
+    # the header trimmer). The provider profile is applied explicitly so
+    # deepagents' own defaults still hold (openai:* → Responses API).
+    chat_model = load_chat_model(model.replace(":", "/", 1), **apply_provider_profile(model))
+
     # SkillRouterMiddleware = SkillsMiddleware + per-request top-k selection.
     # top_k above the catalog size behaves exactly like the static listing;
     # shrink the catalog or raise the count later without touching the graph.
@@ -84,7 +94,7 @@ def build_research_agent(mcp_tools: Sequence[BaseTool] = (), model: str = DEFAUL
     # deepagents' built-ins come free: todo planning, virtual filesystem
     # (ls/read_file/write_file/edit_file), and the `task` delegation tool.
     return create_deep_agent(
-        model=model,
+        model=chat_model,
         tools=[web_search, think_tool, make_plan_tool(), *mcp_tools],
         system_prompt=RESEARCH_SYSTEM_PROMPT,
         subagents=SUBAGENTS,

@@ -121,6 +121,7 @@ def load_chat_model(
     fully_specified_name: str,
     *,
     extra_body: dict[str, Any] | None = None,
+    **init_kwargs: Any,
 ) -> BaseChatModel:
     """Load a chat model from a fully specified name.
 
@@ -129,9 +130,13 @@ def load_chat_model(
         extra_body (dict | None): Provider-specific request fields merged into
             every call (e.g. disabling a provider's reasoning mode). Passed
             through untouched — keep provider quirks at the call site.
+        **init_kwargs: Extra ``init_chat_model`` arguments, e.g. a framework's
+            provider profile (deepagents' ``apply_provider_profile``). Layered
+            *under* this module's client options, which always win.
     """
     provider, model = fully_specified_name.split("/", maxsplit=1)
-    return init_chat_model(model, model_provider=provider, **_client_kwargs(extra_body))
+    kwargs = {**init_kwargs, **_client_kwargs(extra_body)}
+    return init_chat_model(model, model_provider=provider, **kwargs)
 
 
 def _load_resilient(fully_specified_name: str, max_retries: int, request_timeout: float) -> BaseChatModel:
