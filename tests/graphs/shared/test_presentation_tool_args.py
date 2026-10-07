@@ -58,7 +58,9 @@ async def test_field_less_tool_receives_the_injected_arguments() -> None:
 
     out = await graph.compile().ainvoke(
         {
-            "messages": [AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "call_1", "type": "tool_call"}])],
+            "messages": [
+                AIMessage(content="", tool_calls=[{"name": "t", "args": {}, "id": "call_1", "type": "tool_call"}])
+            ],
             "presentations": [],
         }
     )
