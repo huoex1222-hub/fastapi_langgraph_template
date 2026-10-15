@@ -6,13 +6,16 @@
 ## TL;DR
 
 ```
-浏览器 ─ POST /threads ─────────→ 建 thread
+浏览器 ─ GET  /threads/{id} ───────→ 探 thread 在不在（404 才 POST /threads 建）
        ─ GET  /threads/{id}/state → 捞【已有】消息（不是拿回答）
        ─ POST /threads/{id}/runs/stream → SSE 长连接，回答从这条回来
 ```
 
 **最终回答走的是 `runs/stream`，不是 `GET /state`。** `getState` 在 stream **之前**执行，
 拿的是发消息之前就存在的历史消息。
+
+**前端自己的代码里只有一处网络调用**（`CatalogGrid.tsx:15` 的裸 `fetch`）——
+其余全部由 `LangGraphAgent` 在内部发出。
 
 **`runs/stream` 同时是触发器和订阅器**：它先 `executor.submit(job)` 把图扔进后台跑，
 **再**返回 SSE 去 broker 订阅 —— 触发发生在返回响应之前，接口本身不是执行者。
@@ -37,32 +40,68 @@ new LangGraphAgent({ deploymentUrl: AGENT_SERVER, graphId: id })
 `AGENTS` 里三个图对应页面上的三个 tab：`shopping_agent` = **Customer**、
 `merchant_agent` = Merchant、`research_agent` = Research。侧边栏默认开的是 Customer。
 
-## 调用的接口
+## 前端调了哪些接口
 
-`@ag-ui/langgraph` 的 `LangGraphAgent` 内部用 `@langchain/langgraph-sdk` 的 client。
-发一句「你好」会走：
+### 两条通道
 
-| 顺序 | client 方法 | HTTP |
+前端**自己的代码里只有一处直接网络调用**，其余全部由 `providers.tsx` 注入的
+`LangGraphAgent` 在内部发出：
+
+| # | 方式 | 谁在用 | 调什么 |
+| --- | --- | --- | --- |
+| ① | **AG-UI `LangGraphAgent`**（内部包 `@langchain/langgraph-sdk` 的 Client） | 对话相关的一切 | Agent Protocol `/threads/*`、`/runs/*` |
+| ② | **裸 `fetch`** | 只有 `CatalogGrid.tsx:15` | 领域 REST `GET /shop/products` |
+| ③ | `<img src>` | `CatalogGrid.tsx:64` | `picsum.photos`（外链，不是后端） |
+
+```ts
+// CatalogGrid.tsx:15 —— 前端源码里唯一一处自己的网络调用
+fetch(`${AGENT_SERVER}/shop/products`)
+```
+
+### 通道 ①：AG-UI 封装的 Agent Protocol 调用
+
+前端代码只写一句：
+
+```ts
+// providers.tsx:39
+new LangGraphAgent({ deploymentUrl: AGENT_SERVER, graphId: id })
+```
+
+其余由 SDK 内部发。从 `@ag-ui/langgraph/dist/index.js` 能直接读到它调了哪些方法：
+
+| SDK 方法 | → HTTP | 什么时候发 |
 | --- | --- | --- |
-| 1 | `threads.create()` | `POST /threads` |
-| 2 | `threads.getState()` | `GET /threads/{id}/state` |
-| 3 | `runs.stream()` | **`POST /threads/{id}/runs/stream`** ← 主事件流 |
+| `threads.get` | `GET /threads/{id}` | 发消息前先探 thread 在不在（404 才 create） |
+| `threads.create` | `POST /threads` | 上面 404 时 |
+| `threads.getState` | `GET /threads/{id}/state` | 开流**之前**，捞历史消息 |
+| **`runs.stream`** | **`POST /threads/{id}/runs/stream`** | **主事件流（SSE 长连接）** |
+| `threads.updateState` | `POST /threads/{id}/state` | HITL 决议回写 |
+| `threads.getHistory` | `GET /threads/{id}/history` | 恢复现场 |
+| `runs.cancel` | `POST /threads/{id}/runs/{run_id}/cancel` | 停止生成 / 客户端断开 |
 
-后续交互里还会出现：
+发一句「你好」只触发前四条。点商品卡片（`page.tsx:141` 的 `ask()`）复用同一 thread，
+只发 `runs/stream`。
 
-| 场景 | 调用 |
-| --- | --- |
-| 点商品卡片（`page.tsx:141` 的 `ask()`） | 复用同一 thread → 只发 `runs/stream` |
-| 刷新页面 / 切 agent 恢复现场 | `GET /threads/{id}/state`、`GET /threads/{id}/history` |
-| 结算中断（HITL）决议 | `POST /threads/{id}/state` |
-| 停止生成 / 客户端断开 | `POST /threads/{id}/runs/{run_id}/cancel` |
+### 通道 ②：为什么没有 SDK
 
-**怎么看真实调用**：F12 → Network → 过滤框输 `2026`，再发消息。
+后端是两个面**合并**进同一个 FastAPI 的（`langgraph.json` 的 `http.app` →
+`src/http_app.py:app`，再由 `app/main.py:create_app` 合并核心路由）：
+
+| 面 | 有 SDK 客户端吗 | 前端怎么调 |
+| --- | --- | --- |
+| Agent Protocol（`/threads`、`/runs`） | ✅ AG-UI + langgraph-sdk | 走封装 |
+| 领域 REST（`/shop/products`） | ❌ 没有 | 组件里裸 `fetch` |
+
+`CatalogGrid.tsx` 的注释点明了这点：*"Catalog browsing over the REST surface —
+same backend the agent uses."*
+
+### 怎么看真实调用
+
+F12 → Network → 过滤框输 `2026`，再发消息。
 `runs/stream` 会显示 `pending` 挂住几秒（流式期间一直不关），结束后变 `200`。
 
-> **不确定**：客户端会在本地生成 threadId（SDK 里 `let u = r ?? randomUUID()`），
-> 但服务端对不存在的 thread 直接 404（`runs.py:170`），所以理论上必定先 `POST /threads`。
-> 第一条请求到底是哪个，Network 面板一看便知。
+> 来源补充：`.workbuddy/memory/2026-10-08.md`（本地笔记，已 gitignore）还提到序列的第一步是
+> `assistants/search`（拿 `assistant_id`）—— **这条没验证过**。
 
 ## 服务端：触发和订阅是两件事
 
