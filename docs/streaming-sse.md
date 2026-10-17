@@ -23,6 +23,50 @@
 **前端不走代理**：`providers.tsx` 里浏览器直连 `http://localhost:2026`，没有 proxy route。
 所以 `HTTPS_PROXY` 那套（mitmweb）只作用于**后端进程**，浏览器的请求不去那儿。
 
+## 协议分层
+
+`/threads/{thread_id}/runs/stream` 是 **Agent Protocol** 定义的，**不是 AG-UI**。
+两者是不同层的东西：
+
+```
+AG-UI                      事件协议：定义 RUN_STARTED / TEXT_MESSAGE_CONTENT /
+   ↑                       STATE_SNAPSHOT / TOOL_CALL_* 这些【事件类型】，
+   │ @ag-ui/langgraph      不定义任何 REST 路径
+   │ （适配器）
+LangGraph SDK              客户端：调 REST + 解析 SSE
+   ↑
+Agent Protocol             REST 协议：/assistants、/threads、/runs、/store、/crons
+```
+
+**AG-UI 是「调用方那层」，Agent Protocol 是「被调用的接口」。** `@ag-ui/langgraph`
+只做翻译：
+
+```
+Agent Protocol 的 SSE 帧            AG-UI 事件
+  values / updates / messages  →  STATE_SNAPSHOT / TEXT_MESSAGE_CONTENT / ...
+```
+
+项目自己也是这么定位的：
+
+- `README.md:5` —— *"It speaks the Agent Protocol (LangGraph Platform compatible), so the
+  LangGraph SDK, Agent Chat UI and LangGraph Studio work against it out of the box"*
+- `docs/openapi.json` 的 `info.description` —— *"Production-ready Agent Protocol server"*
+
+服务端只要符合 Agent Protocol，LangGraph SDK / Studio / Agent Chat UI 都能直连 ——
+AG-UI 只是众多前端消费方式之一。
+
+### Agent Protocol 内部还分两代
+
+| | **v1**（AG-UI 当前在用） | **v2** |
+| --- | --- | --- |
+| 端点 | `POST /threads/{id}/runs/stream` | `POST /threads/{id}/stream/events`<br>`POST /threads/{id}/commands` |
+| 事件形状 | `values` / `updates` / `messages` | 协议事件信封（按 channel 过滤） |
+| 项目状态 | ✅ | ✅ 也实现了（`event_streaming.py`），由 flag 门控 |
+| AG-UI | 默认 `streamProtocol="legacy"` 走这条 | ❌ 不走 |
+
+所以更准确的说法是：**这个端点是 Agent Protocol v1 的「run-scoped SSE」**，
+AG-UI 的默认配置恰好选了它，而不是 v2 的 thread-scoped event stream。
+
 ## 前端结构
 
 | 文件 | 作用 |
@@ -246,12 +290,75 @@ broker = broker_manager.get_broker(run_id)
     └─────────┘
 ```
 
+### broker 内部：广播 + 历史
+
+不是「一个队列被多方争抢」，是**广播**。内存实现（`broker.py:38`）：
+
+```python
+self._replay_buffer: list[tuple[str, Any]] = []                  # 历史（重连用）
+self._subscribers: set[asyncio.Queue[tuple[str, Any]]] = set()   # 每个消费者一个队列
+```
+
+`put()` 同时做两件事（`broker.py:43`）：
+
+```python
+if resumable:
+    self._replay_buffer.append((event_id, payload))   # ① 存历史
+for queue in list(self._subscribers):
+    queue.put_nowait((event_id, payload))             # ② 广播给每个订阅者
+```
+
+类 docstring：*"per-subscriber fan-out + replay buffer … each `aiter()` caller gets its own
+queue … so multiple concurrent SSE consumers on one run each receive every event."*
+
+**所以多个 SSE 连接可以同时看同一个 run，每人都拿到全量事件。**
+
+**生产者不等消费者**：`put()` 写完历史就返回，`_subscribers` 为空也无所谓。这正是
+「客户端断开 run 继续跑」和「事后重连能补」的底层原因。
+
+`aiter()` 里还有个防丢设计（`broker.py:60-69`）—— **先注册、再读历史**：
+
+```python
+self._subscribers.add(queue)          # 先注册
+backlog = list(self._replay_buffer)   # 再取快照
+for ... backlog: yield ...
+# 然后才进实时循环
+```
+
+这样「补发」和「实时」之间的窗口里产生的事件会落进队列，不丢；重叠部分靠 `event_id` 去重。
+
+Redis 模式下结构变了、语义没变：
+
+| | 内存（`RunBroker`） | Redis（`RedisRunBroker`） |
+| --- | --- | --- |
+| 广播 | `set[asyncio.Queue]` + `put_nowait` | Redis **pub/sub** |
+| 历史 | Python list | Redis **List**（`RPUSH` + `LTRIM`） |
+
+> 严格说 Redis 模式下「队列」这个词就不准了 —— 那时是发布/订阅 + 一个 List 做补发。
+
+**完整调用链**（浏览器不碰队列，它消费的是 HTTP 流）：
+
+```
+LangGraph（executor task）
+    │ put(event_id, payload)
+    ▼
+broker ──┬─ replay buffer（list，历史）
+         └─ 订阅者队列（fan-out）
+                 │
+      ┌──────────┴──────────┐
+      ▼                     ▼
+ SSE 连接 A             SSE 连接 B        ← 端点作为【订阅者】
+      │                     │
+      ▼                     ▼
+  浏览器 A               浏览器 B        ← 消费 HTTP/SSE 字节流
+```
+
 ### 这个解耦带来三个能力
 
 | 能力 | 靠什么 |
 | --- | --- |
 | `on_disconnect="continue"`：客户端关了，run 继续跑 | 图不依赖连接 |
-| 断线重连不丢事件 | `last_event_id` → `broker.replay()` |
+| 断线重连不丢事件 | `last_event_id` → `broker.replay()`（详见下文「断线重连」） |
 | 多实例（任意 pod 都能服务流） | `RedisRunBroker` 的 pub/sub |
 
 ### 两种 broker
@@ -303,6 +410,125 @@ broker = broker_manager.get_broker(run_id)
 | `stream_mode` 含 `events` | `graph_streaming.py:209` 的 `graph.astream_events(...)` |
 | 其余（默认） | `graph_streaming.py:297` 的 `graph.astream(...)` |
 | Agent Protocol **v2** 协议 | `usecase/streaming/v2/native_stream.py:77` |
+
+## 断线重连
+
+**事件带序号 ID → broker 存 replay buffer → 重连带 `Last-Event-ID` → 先补历史、再实时、按序号去重。**
+
+### ① 事件 ID 带序号
+
+```python
+# infra/sse_utils.py:1
+def generate_event_id(run_id: str, sequence: int) -> str:
+    """Generate SSE event ID in the format: {run_id}_event_{sequence}"""
+```
+
+序号由 broker **原子分配**（`base_broker.py:107` 的 `allocate_event_id`），Redis 模式下用
+INCR，跨实例唯一。
+
+### ② broker 存一份 replay buffer
+
+每个事件写进 broker 时同时入缓存：
+
+| | 内存（`broker.py`） | Redis（`redis_broker.py`） |
+| --- | --- | --- |
+| 结构 | `_replay_buffer: list` | Redis List（`RPUSH`） |
+| 上限 | 无条数上限 | `LTRIM` 保留最近 **10,000** 条 |
+| 保留期 | `REPLAY_RETENTION_SECONDS = 600` 后清扫 | TTL **600 秒**，每次写入刷新 |
+
+### ③ 重连走专门的 GET 接口
+
+```python
+# runs.py:418
+@router.get("/threads/{thread_id}/runs/{run_id}/stream", ...)
+async def stream_run(
+    thread_id: str,
+    run_id: str,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),   # ← 关键
+    ...
+) -> EventSourceResponse:
+```
+
+### ④ 补发历史
+
+```python
+# streaming_service.py:127
+async def _replay_stored_events(self, run_id, last_event_id):
+    broker = broker_manager.get_or_create_broker(run_id)
+    stored_events = await broker.replay(last_event_id)
+    ...
+```
+
+`broker.replay()` 的三种情况（`broker.py:83`）：
+
+| `last_event_id` | 返回 |
+| --- | --- |
+| `None`（首次连接） | **全部** buffer |
+| 在 buffer 里找到 | 它**之后**的事件 |
+| **找不到**（已被淘汰） | **全部** buffer ← 降级 |
+
+### ⑤ 再切到实时，按序号去重
+
+```python
+# streaming_service.py:84
+async for event_id, sse_event in self._replay_stored_events(run_id, last_event_id):
+    last_sent_sequence = max(last_sent_sequence, extract_event_sequence(event_id))
+    yield sse_event
+
+async for sse_event in self._stream_live_events(run, last_sent_sequence):
+    yield sse_event
+```
+
+```python
+# streaming_service.py:141
+async for event_id, raw_event in broker.aiter():
+    current_sequence = extract_event_sequence(event_id)
+    if current_sequence <= last_sent_sequence:     # ← 已补发过的跳过
+        continue
+    ...
+```
+
+**补发和实时之间没有断档**：补发结束时的最大序号就是实时的起点。
+
+### ⑥ 已结束的 run 也能补
+
+```python
+# runs.py:455
+# If already terminal and no Last-Event-ID, just emit end.
+# If Last-Event-ID is present, fall through to stream_run_execution
+if run_status in TERMINAL_STATES and not last_event_id:
+    ...
+```
+
+带 `Last-Event-ID` 时会掉进正常流程，从 buffer 把错过的事件全补回来。
+
+### 客户端
+
+SDK 不用浏览器的 `EventSource`（只能 GET），自己实现了重连：
+
+| 参数 | 默认值 |
+| --- | --- |
+| `maxReconnectAttempts` | **5** |
+| `idleReconnect` | `"auto"` |
+| 退避 | `min(1000 × 2^(attempt-1), 5000) + random(0, 1000)` ms |
+
+重连时把上次收到的 ID 塞进请求头（`dist/client/base.cjs`）：
+
+```js
+const requestHeaders = isReconnect && reconnectParams?.lastEventId
+  ? { "Last-Event-ID": reconnectParams.lastEventId, ... }
+  : ...
+```
+
+### 边界 / 坑
+
+| 情况 | 后果 |
+| --- | --- |
+| 断开超过 **10 分钟** | buffer 已清扫，补不回来；`get_or_create_broker` 建空 broker，补发 `[]`，**静默少一段** |
+| `last_event_id` 找不到 | `replay()` 退化成返回**全部** buffer → 客户端可能收到**重复事件** |
+| 内存模式 + 多实例 | 重连落到另一进程 → 没有该 run 的 broker → 补发为空。**可靠重连必须开 Redis** |
+| 内存 buffer 无条数上限 | 只靠 10 分钟清扫，超长 run 会在内存里堆很多事件 |
+| keepalive | `KEEPALIVE_INTERVAL_SECS` 发的注释行**不带 event id**，不参与重连 |
 
 ## SSE 是可选的吗
 
