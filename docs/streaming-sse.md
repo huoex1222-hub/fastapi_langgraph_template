@@ -79,8 +79,8 @@ new LangGraphAgent({ deploymentUrl: AGENT_SERVER, graphId: id })
 | `threads.getHistory` | `GET /threads/{id}/history` | 恢复现场 |
 | `runs.cancel` | `POST /threads/{id}/runs/{run_id}/cancel` | 停止生成 / 客户端断开 |
 
-发一句「你好」只触发前四条。点商品卡片（`page.tsx:141` 的 `ask()`）复用同一 thread，
-只发 `runs/stream`。
+这张表是**代码可读到的全部方法**，一次「你好」只会用到其中一部分 —— 实际发了哪几条见
+下方「实测调用链」。点商品卡片（`page.tsx:141` 的 `ask()`）复用同一 thread，只发 `runs/stream`。
 
 ### 通道 ②：为什么没有 SDK
 
@@ -100,8 +100,46 @@ same backend the agent uses."*
 F12 → Network → 过滤框输 `2026`，再发消息。
 `runs/stream` 会显示 `pending` 挂住几秒（流式期间一直不关），结束后变 `200`。
 
-> 来源补充：`.workbuddy/memory/2026-10-08.md`（本地笔记，已 gitignore）还提到序列的第一步是
-> `assistants/search`（拿 `assistant_id`）—— **这条没验证过**。
+### 实测调用链
+
+在 Customer 侧边栏发一句「你好」，Chrome Network 里实际是这 7 条：
+
+```
+GET  /threads/0890e1cc-…              ← threads.get（thread 已存在，没走到 create）
+GET  /threads/0890e1cc-…/state        ← threads.getState，开流前捞历史
+GET  /assistants/243920ff-…/schemas   ← 来源未确定
+GET  /assistants/243920ff-…/graph     ← 来源未确定
+POST /threads/0890e1cc-…/runs/stream  ← 主事件流
+GET  /threads/0890e1cc-…/state        ← 之后又发了两次
+GET  /threads/0890e1cc-…/state
+```
+
+**没有 `POST /threads`** —— `threads.get` 那次成功了，所以没走到 create。
+
+**assistant_id 是算出来的，不是查出来的**（`repo/graphs/langgraph_service.py:196`）：
+
+```python
+NS = ASSISTANT_NAMESPACE_UUID        # 6ba7b821-9dad-11d1-80b4-00c04fd430c8
+assistant_id = str(uuid5(NS, graph_id))
+```
+
+```
+uuid5(NS, 'shopping_agent') = 243920ff-4b8f-5c79-a285-ee73d56fd22a   ← 与实测一致
+uuid5(NS, 'merchant_agent') = 06a74579-e0a4-5bd2-83bc-d0170f90855a
+uuid5(NS, 'research_agent') = 9dc0ca3b-1aa6-547d-93f0-e21597d2011c
+```
+
+同一个 graph 永远对应同一个 assistant UUID —— 客户端不需要先 `assistants/search` 去查。
+
+### 两个未解释的点（记录，未查清）
+
+1. **谁发的 `/assistants/{id}/schemas` 和 `/graph`** —— 不是 `@ag-ui/langgraph`
+   （那个包里没有任何 `assistants.*` 调用，也没有 uuid 代码），也没在
+   `@copilotkit/react-core/dist` 里搜到。
+2. **`GET /threads/{id}/state` 为什么发 3 次**（开流前 1 次、开流后 2 次）。
+
+> **已推翻**：`.workbuddy/memory/2026-10-08.md`（本地笔记，gitignored）说序列第一步是
+> `assistants/search` —— 实测这一轮里没有它。
 
 ## 服务端：触发和订阅是两件事
 
