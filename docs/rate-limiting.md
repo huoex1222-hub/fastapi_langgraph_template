@@ -11,7 +11,7 @@
 | **算法** | `MovingWindowRateLimiter`（滑动窗口） |
 | **存储** | `REDIS_BROKER_ENABLED=true` → Redis（多副本共享）；否则内存 |
 | **两档** | `RATE_LIMIT_DEFAULT=200/minute`、`RATE_LIMIT_RUNS=30/minute` |
-| **超限** | 429 + `Retry-After`，走 Agent Protocol 错误体 |
+| **超限** | 429，body 走 Agent Protocol 形状（`error: rate_limited`），带 `Retry-After` header |
 | **默认** | **关闭** —— `RATE_LIMIT_ENABLED=false` |
 
 ## 代码位置
@@ -31,6 +31,7 @@ async def rate_limit_default(request, user=Depends(get_current_user)) -> None:
     """Generous tier for ordinary endpoints (`RATE_LIMIT_DEFAULT`)."""
     await _enforce(request, user, "default", settings.app.RATE_LIMIT_DEFAULT)
 
+
 # auth/rate_limit.py:81
 async def rate_limit_runs(request, user=Depends(get_current_user)) -> None:
     """Tighter tier for run/streaming endpoints (`RATE_LIMIT_RUNS`)."""
@@ -44,8 +45,11 @@ async def rate_limit_runs(request, user=Depends(get_current_user)) -> None:
 async def _enforce(request, user, tier, limit_expr) -> None:
     if not settings.app.RATE_LIMIT_ENABLED:
         return
-    key = f"user:{user.identity}" if user.identity != "anonymous" \
-          else f"ip:{request.client.host if request.client else 'unknown'}"
+    key = (
+        f"user:{user.identity}"
+        if user.identity != "anonymous"
+        else f"ip:{request.client.host if request.client else 'unknown'}"
+    )
     limit = parse(limit_expr)
     if not _get_limiter().hit(limit, tier, key):
         logger.warning("rate_limit_exceeded", tier=tier, key=key, path=request.url.path)
@@ -63,14 +67,14 @@ async def _enforce(request, user, tier, limit_expr) -> None:
 
 ```python
 # app/main.py:404
-app.include_router(health_router)                                          # 不限流
-app.include_router(assistants_router,      dependencies=[Depends(rate_limit_default)])
-app.include_router(threads_router,         dependencies=[Depends(rate_limit_default)])
-app.include_router(runs_router,            dependencies=[Depends(rate_limit_runs)])    # 紧
-app.include_router(stateless_runs_router,  dependencies=[Depends(rate_limit_runs)])    # 紧
-app.include_router(crons_router,           dependencies=[Depends(rate_limit_default)])
-app.include_router(store_router,           dependencies=[Depends(rate_limit_default)])
-app.include_router(event_streaming_router, dependencies=[Depends(rate_limit_runs)])    # 紧
+app.include_router(health_router)  # 不限流
+app.include_router(assistants_router, dependencies=[Depends(rate_limit_default)])
+app.include_router(threads_router, dependencies=[Depends(rate_limit_default)])
+app.include_router(runs_router, dependencies=[Depends(rate_limit_runs)])  # 紧
+app.include_router(stateless_runs_router, dependencies=[Depends(rate_limit_runs)])  # 紧
+app.include_router(crons_router, dependencies=[Depends(rate_limit_default)])
+app.include_router(store_router, dependencies=[Depends(rate_limit_default)])
+app.include_router(event_streaming_router, dependencies=[Depends(rate_limit_runs)])  # 紧
 ```
 
 **为什么 runs 档更紧**（`main.py:399` 的注释）：
@@ -151,7 +155,7 @@ if not _get_limiter().hit(limit, tier, key):     # ← 没有 try/except
 
 ```python
 if http_config and http_config.get("enable_custom_route_auth", False):
-    _apply_auth_to_custom_routes(application, CUSTOM_ROUTE_AUTH)   # 只有 auth
+    _apply_auth_to_custom_routes(application, CUSTOM_ROUTE_AUTH)  # 只有 auth
 ```
 
 限流是随 `_include_core_routers` 挂上去的，所以 `/shop/products`、`/ml/*`、`/hub/*`
@@ -165,7 +169,31 @@ if http_config and http_config.get("enable_custom_route_auth", False):
 ### 5. `Retry-After` 是窗口长度，不是精确剩余时间
 
 ```python
-headers={"Retry-After": str(int(limit.get_expiry()))}
+headers = {"Retry-After": str(int(limit.get_expiry()))}
 ```
 
 对 `200/minute` 就是固定 60 秒，即使用户其实再过 2 秒就滑出窗口了。
+
+### 6. 自定义错误 handler 会重建响应 —— header 必须显式转发
+
+`agent_protocol_exception_handler`（`main.py:203`）不是「改一下 body」，而是**重新构造
+一个 `JSONResponse`**。所以 raise 处放在 `HTTPException(headers=...)` 上的东西
+（比如限流的 `Retry-After`）必须手动转发，否则**静默丢失**：
+
+```python
+return JSONResponse(
+    status_code=exc.status_code,
+    content=...,
+    headers=exc.headers,  # ← 少了这行，Retry-After 就到了不了浏览器
+)
+```
+
+同一条链上还有第二个坑：`get_error_type()` 的映射表原先没有 429，限流错误返回的是
+`"error": "unknown_error"`。已补 `429: "rate_limited"`。
+
+**为什么单测没抓到**：原来的 `test_rejects_beyond_limit_with_retry_after` 直接调
+`rate_limit_default()`、断言**抛出的异常对象**上有 header —— 从没经过 FastAPI 的 HTTP 层。
+现在补了一个走 `TestClient` 的用例，断言的是**真实响应**的 header 和 body。
+
+> 教训：断言异常对象 ≠ 断言 HTTP 响应。凡是"handler 会重建响应"的地方，
+> 单测都得穿过框架边界。

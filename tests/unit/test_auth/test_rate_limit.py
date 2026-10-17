@@ -61,3 +61,36 @@ async def test_disabled_is_passthrough(monkeypatch) -> None:
     user = User(identity="dave")
     for _ in range(10):
         await rate_limit_runs(_request(), user)
+
+
+def test_rate_limit_response_keeps_retry_after_and_error_type() -> None:
+    """The 429 must survive the Agent Protocol error handler intact.
+
+    That handler rebuilds the response from scratch, so a header attached to
+    the HTTPException is dropped unless forwarded explicitly. Asserting on the
+    exception object (as the tests above do) cannot catch that — this test goes
+    through the HTTP layer instead.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from agent_server.app.main import agent_protocol_exception_handler
+
+    app = FastAPI()
+    app.add_exception_handler(HTTPException, agent_protocol_exception_handler)
+
+    @app.get("/limited")
+    def limited() -> None:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Retry later.",
+            headers={"Retry-After": "60"},
+        )
+
+    response = TestClient(app).get("/limited")
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "60"
+    body = response.json()
+    assert body["error"] == "rate_limited"
+    assert body["message"] == "Rate limit exceeded. Retry later."

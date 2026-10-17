@@ -201,7 +201,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 # Define core exception handlers
 async def agent_protocol_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    """Convert HTTP exceptions to Agent Protocol error format"""
+    """Convert HTTP exceptions to Agent Protocol error format.
+
+    The response is rebuilt from scratch, so anything the raise site attached
+    to the exception must be forwarded by hand — notably ``Retry-After`` on the
+    429 that ``auth/rate_limit.py`` raises.
+    """
     return JSONResponse(
         status_code=exc.status_code,
         content=AgentProtocolError(
@@ -209,6 +214,7 @@ async def agent_protocol_exception_handler(_request: Request, exc: HTTPException
             message=exc.detail,
             details=getattr(exc, "details", None),
         ).model_dump(),
+        headers=exc.headers,
     )
 
 
