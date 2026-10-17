@@ -55,6 +55,62 @@ Agent Protocol 的 SSE 帧            AG-UI 事件
 服务端只要符合 Agent Protocol，LangGraph SDK / Studio / Agent Chat UI 都能直连 ——
 AG-UI 只是众多前端消费方式之一。
 
+### AG-UI 到底干什么
+
+**后端完全不知道 AG-UI 存在。** `grep -rni "ag-ui" src/` 只命中一条注释（`domain/runs.py:152`
+提到「AG-UI 客户端会这么发」）—— 服务端只认 Agent Protocol，所以 LangGraph Studio /
+Agent Chat UI / curl 都能连。
+
+它存在的理由：**两者的「事件语义」不同**。
+
+| Agent Protocol 的 SSE 帧 | 它是给状态机看的 |
+| --- | --- |
+| `values` | 完整 state 快照 |
+| `updates` | 某节点的增量 |
+| `messages` | LangChain 消息元组 |
+| `checkpoint` | 断点信息 |
+
+UI 要的不是这些，而是「往气泡追加一个字」「画一个工具卡片」「更新应用状态」。
+`@ag-ui/langgraph` 就干这个翻译（`EventType.*` 共 20 种）：
+
+| 收到的帧 | 翻成 AG-UI 事件 | UI 反应 |
+| --- | --- | --- |
+| `metadata`（含 run_id） | `RUN_STARTED` | 显示「思考中」 |
+| token 流 | `TEXT_MESSAGE_START` / `CONTENT` / `END` | 打字机效果 |
+| 工具调用 | `TOOL_CALL_START` / `ARGS` / `END` / `RESULT` | 工具卡片 |
+| `values` / `updates` | `STATE_SNAPSHOT` | 更新 `agent.state` |
+| 推理块 | `REASONING_START` / `MESSAGE_CONTENT` / `END` | 折叠的思考过程 |
+| `end` / 错误 | `RUN_FINISHED` / `RUN_ERROR` | 结束状态 |
+
+### 它在项目里干三件事
+
+1. **HTTP 客户端** —— 那 10 个 `this.client.*` 调用，走 Agent Protocol（见下节）。
+2. **事件翻译器** —— SSE 帧 → 上面的 AG-UI 事件。
+3. **生成式 UI 的桥**（最值钱的一件）：
+
+```
+图的 presentations/cart 状态
+   → SSE values 帧
+   → AG-UI STATE_SNAPSHOT
+   → useAgent({updates:[OnStateChanged]})
+   → page.tsx 的组件注册表
+   → <ProductCarousel> / <PlanChecklist> …
+```
+
+没有 AG-UI，这条链要自己写：解析 SSE、diff state、触发 React 更新。
+
+### 换掉它，后端不用改
+
+| 换成 | 要做什么 |
+| --- | --- |
+| LangGraph Studio | 什么都不用改（它也讲 Agent Protocol） |
+| 自己写的 `fetch` + SSE 解析 | 自己解析 `values` / `updates` 帧 |
+| curl | 直接看原始帧 |
+
+**AG-UI 是「消费 Agent Protocol 的一种方式」，不是协议本身的一部分。**
+
+> 一句话：**Agent Protocol 决定「后端说什么」，AG-UI 决定「前端怎么听懂并画出来」。**
+
 ### Agent Protocol 内部还分两代
 
 | | **v1**（AG-UI 当前在用） | **v2** |
@@ -66,6 +122,106 @@ AG-UI 只是众多前端消费方式之一。
 
 所以更准确的说法是：**这个端点是 Agent Protocol v1 的「run-scoped SSE」**，
 AG-UI 的默认配置恰好选了它，而不是 v2 的 thread-scoped event stream。
+
+## 协议一致性对照
+
+后端实现的是 Agent Protocol，`@ag-ui/langgraph` 调的是它下面的 LangGraph SDK。
+把 SDK 会打的路径和后端注册的路由（`docs/openapi.json`）逐项对一遍。
+
+### 前端实际用到的 10 个 —— 全部一致
+
+| SDK 方法 | 后端路由 |
+| --- | --- |
+| `assistants.search` | `POST /assistants/search` |
+| `assistants.getGraph` | `GET /assistants/{assistant_id}/graph` |
+| `assistants.getSchemas` | `GET /assistants/{assistant_id}/schemas` |
+| `threads.create` | `POST /threads` |
+| `threads.get` | `GET /threads/{thread_id}` |
+| `threads.getState` | `GET /threads/{thread_id}/state` |
+| `threads.getHistory` | `GET /threads/{thread_id}/history` |
+| `threads.updateState` | `POST /threads/{thread_id}/state` |
+| `runs.stream` | `POST /threads/{thread_id}/runs/stream` |
+| `runs.cancel` | `POST /threads/{thread_id}/runs/{run_id}/cancel` |
+
+这 10 个是 `@ag-ui/langgraph/dist/index.js` 里 `this.client.*` 的**全部**调用点。
+
+### 全量协议面
+
+后端已实现（与 SDK 对应）：
+
+| 面 | 覆盖 |
+| --- | --- |
+| Assistants | `GET/POST /assistants`、`/{id}` 的 GET/PATCH/DELETE、`/search`、`/count`、`/{id}/latest`、`/versions`、`/graph`、`/schemas`、`/subgraphs` |
+| Threads | `GET/POST /threads`、`/{id}`、`/state`、`/state/{ckpt}`、`/state/checkpoint`、`/history`、`/search`、`/prune` |
+| Runs | `/{tid}/runs`、`/stream`、`/wait`、`/{rid}`、`/{rid}/cancel`、`/{rid}/join`、`/{rid}/stream`；stateless 的 `/runs`、`/runs/stream`、`/runs/wait`、`/runs/cancel` |
+| Crons | `/runs/crons`、`/{tid}/runs/crons`、`/{cid}`、`/search`、`/count` |
+| Store | `/store/items`、`/store/items/search`、`/store/namespaces` |
+| v2 事件流 | `/threads/{id}/stream/events`、`/threads/{id}/commands` |
+
+后端缺的 4 个（SDK 有，前端不用）：
+
+| SDK 方法 | SDK 路径 | 说明 |
+| --- | --- | --- |
+| `threads.count()` | `POST /threads/count` | 线程计数 |
+| `threads.copy()` | `POST /threads/{id}/copy` | 复制线程 |
+| `threads.joinStream()` | `GET /threads/{id}/stream` | **thread 级长连接**（带 `Last-Event-ID`） |
+| `runs.joinStream(id, null)` | `GET /runs/{run_id}/stream` | stateless run 的断点续流 |
+
+这四个不影响当前前端；但若要「订阅整个 thread 的事件」或「线程计数」，会撞上。
+
+## thread_id 和 run_id
+
+**`run_id` = 一次图执行的唯一标识。** 用户在同一个 thread 里每问一句，就产生一个新的
+`run_id`。
+
+| | `thread_id` | `run_id` |
+| --- | --- | --- |
+| 是什么 | **会话 / 状态容器** | **一次执行** |
+| 生命周期 | 跨多轮，持久 | 一次 run，跑完就结束 |
+| 谁在用 | checkpointer 的 key、消息历史 | 事件、任务、取消、日志 |
+| 类比 | 一个聊天会话 | 会话里的一条「提问-回答」 |
+
+```
+thread_id = 0890e1cc-…（你问「你好」的那个会话）
+   ├─ run_id = aaaa…   ← 第一句
+   ├─ run_id = bbbb…   ← 第二句
+   └─ run_id = cccc…   ← 第三句
+```
+
+### run_id 被谁用
+
+| 层面 | 用途 | 位置 |
+| --- | --- | --- |
+| 数据库 | `RunORM` 主键，一条执行记录 | `run_preparation.py` |
+| API 路径 | `/threads/{tid}/runs/{run_id}` 的查 / 等 / 流 / 取消 | `runs.py` |
+| 任务注册表 | `active_runs[run_id] = task` — 取消时靠它找到 asyncio task | `local_executor.py:36` |
+| broker | 每个 run 一个 broker；replay buffer 和订阅者都挂在它下面 | `broker_manager` |
+| 事件 ID | `{run_id}_event_{seq}` — 每个事件自带 run 归属 | `sse_utils.py:1` |
+| 取消 | `request_cancel(run_id)` | `broker.py:162` |
+| 观测 | 绑进 structlog contextvars，作为 `x-run-id` 请求头发给 LLM，也写进 Langfuse metadata | `make_run_trace_context`、`_correlation_headers` |
+| Redis | 缓存 key / 计数 key / 取消频道都按 run_id 隔离 | `redis_broker.py` |
+
+### 为什么事件 ID 要带 run_id
+
+```python
+# infra/sse_utils.py:1
+def generate_event_id(run_id: str, sequence: int) -> str:
+    """Generate SSE event ID in the format: {run_id}_event_{sequence}"""
+```
+
+`Last-Event-ID` 会跨连接传回来，带上 `run_id` 之后：
+
+- 服务端能确认「这个断点属于哪个 run」
+- 同一个 thread 下有多个 run 时，事件不会串
+- `extract_event_sequence()` 切出序号做去重
+
+### 它也是排障的锚点
+
+| 键 | 粒度 |
+| --- | --- |
+| `thread_id` | 整个会话 |
+| **`run_id`** | **一次执行**（mitmweb 里 `~hq"x-run-id: <uuid>"` 筛这个） |
+| `x-ds-trace-id` | 单次 LLM 调用 |
 
 ## 前端结构
 
@@ -175,15 +331,17 @@ uuid5(NS, 'research_agent') = 9dc0ca3b-1aa6-547d-93f0-e21597d2011c
 
 同一个 graph 永远对应同一个 assistant UUID —— 客户端不需要先 `assistants/search` 去查。
 
-### 两个未解释的点（记录，未查清）
+### 两个待查的点
 
-1. **谁发的 `/assistants/{id}/schemas` 和 `/graph`** —— 不是 `@ag-ui/langgraph`
-   （那个包里没有任何 `assistants.*` 调用，也没有 uuid 代码），也没在
-   `@copilotkit/react-core/dist` 里搜到。
-2. **`GET /threads/{id}/state` 为什么发 3 次**（开流前 1 次、开流后 2 次）。
+1. ~~谁发的 `/assistants/{id}/schemas` 和 `/graph`~~ → **已查明：就是 `@ag-ui/langgraph`
+   自己发的。** `getSchemaKeys()` 调 `assistants.getSchemas`，`prepareStream()` 调
+   `assistants.getGraph`（`dist/index.js` 里的 `this.client.assistants.*`）。
+2. **`GET /threads/{id}/state` 为什么发 3 次**（开流前 1 次、开流后 2 次）—— 仍未查清。
 
-> **已推翻**：`.workbuddy/memory/2026-10-08.md`（本地笔记，gitignored）说序列第一步是
-> `assistants/search` —— 实测这一轮里没有它。
+> **更正**：`.workbuddy/memory/2026-10-08.md` 说序列第一步是 `assistants/search` ——
+> **这条是对的**。`getAssistant()` 里调 `assistants.search({graphId, limit: 1})` 解析
+> assistant_id。它没出现在这次按消息录制的 Network 窗口里，是因为它在更早的初始化阶段
+> 就发了（或被缓存），不代表没有。
 
 ## 服务端：触发和订阅是两件事
 
@@ -411,6 +569,57 @@ broker ──┬─ replay buffer（list，历史）
 | 其余（默认） | `graph_streaming.py:297` 的 `graph.astream(...)` |
 | Agent Protocol **v2** 协议 | `usecase/streaming/v2/native_stream.py:77` |
 
+## 响应头分层
+
+`POST /threads/{id}/runs/stream` 的响应头，按「为什么存在」可以分三层 —— 只有最外一层
+是为浏览器 SDK 服务的：
+
+| 头 | 性质 | 跟 SDK 有关吗 |
+| --- | --- | --- |
+| `Content-Type: text/event-stream` | W3C SSE 标准 | ❌ |
+| `Cache-Control: no-cache` | 标准 | ❌ |
+| `Connection: keep-alive` | 标准 | ❌ |
+| `X-Accel-Buffering: no` | nginx 部署相关（关掉代理缓冲） | ❌ |
+| `Location` / `Content-Location` | 标准 HTTP 头，用法是 Agent Protocol 约定 | ⚠️ |
+| `Access-Control-Allow-Origin: *` | CORS | ⚠️ 浏览器才需要 |
+| `Access-Control-Allow-Headers: Last-Event-ID` | CORS | ✅ 为让 JS 能带重连头 |
+| `expose_headers = [Content-Location, Location]` | CORS 暴露 | ✅ 为让 JS 能读这两个头 |
+
+**SSE 主体是纯标准** —— 任何 SSE 客户端（`EventSource`、curl、Python）都能消费，不是为
+某个 SDK 定制的。
+
+**真正「为前端 SDK 而设」的只有 CORS 那一层**：
+
+```python
+# main.py
+# Default CORS headers required for LangGraph SDK stream reconnection
+DEFAULT_EXPOSE_HEADERS = ["Content-Location", "Location"]
+```
+
+```python
+# infra/sse.py:72
+"Access-Control-Allow-Headers": "Last-Event-ID",
+```
+
+浏览器跨域时，默认**读不到**非 `expose_headers` 的响应头、**发不出**非 `allow_headers`
+的请求头。换成 curl 或服务端客户端，这两条根本不需要。
+
+### 服务端是「按协议给」，不是「按这个前端给」
+
+`Content-Location` 这条通道，`@ag-ui/langgraph` **压根没用**（它等流事件，见「取消」一节）。
+这些头服务于 Agent Protocol 的其它客户端 —— LangGraph Studio、Agent Chat UI、其它 SDK 用法。
+
+### 缺口：这些头没写进 OpenAPI
+
+```json
+"responses": { "200": { ... } }      // docs/openapi.json 里没有 "headers" 字段
+```
+
+依赖 `Content-Location` 拿 run_id 的客户端，依赖的是**未文档化的行为**。对这个仓库有点
+矛盾 —— 它有一套很严的 `make openapi-check` 漂移门禁，但这两个头在契约里是隐形的。
+
+> 一句话：**协议优先（Agent Protocol 兼容），SDK 便利性其次（CORS 暴露）。**
+
 ## 断线重连
 
 **事件带序号 ID → broker 存 replay buffer → 重连带 `Last-Event-ID` → 先补历史、再实时、按序号去重。**
@@ -529,6 +738,127 @@ const requestHeaders = isReconnect && reconnectParams?.lastEventId
 | 内存模式 + 多实例 | 重连落到另一进程 → 没有该 run 的 broker → 补发为空。**可靠重连必须开 Redis** |
 | 内存 buffer 无条数上限 | 只靠 10 分钟清扫，超长 run 会在内存里堆很多事件 |
 | keepalive | `KEEPALIVE_INTERVAL_SECS` 发的注释行**不带 event id**，不参与重连 |
+
+## 取消
+
+前端在对话框里点「停止」，最终落到 **`run_id`** 上 —— 它是 `active_runs` 这个字典的 key。
+
+### 显式路径
+
+`@ag-ui/langgraph` 的 `abortRun()`：
+
+```js
+abortRun() {
+  this.cancelRequested = true;
+  let threadId = this.activeRun?.threadId;
+  let runId    = this.activeRun?.id;
+  threadId && runId && !this.cancelSent
+    && this.client.runs.cancel(threadId, runId).then(() => { this.cancelSent = true }).catch(() => {});
+  super.abortRun();          // ← 同时中断本地流
+}
+```
+
+→ `POST /threads/{thread_id}/runs/{run_id}/cancel`（`runs.py:487`），带两个可选 query：
+`wait=1`（最多等 10 秒让 task 落定）、`action=cancel|interrupt`。
+
+### run_id 什么时候到客户端手里
+
+**服务端其实在响应头里就给了**（`runs.py:196`）：
+
+```python
+headers={
+    **get_sse_headers(),
+    "Location": f"/threads/{thread_id}/runs/{run_id}/stream",
+    "Content-Location": f"/threads/{thread_id}/runs/{run_id}",
+},
+```
+
+而且 `main.py` 专门把这两个头 CORS 暴露出去：
+
+```python
+# Default CORS headers required for LangGraph SDK stream reconnection
+DEFAULT_EXPOSE_HEADERS = ["Content-Location", "Location"]
+```
+
+**SDK 也实现了从响应头解析**（`dist/client/base.cjs:212`）：
+
+```js
+const REGEX_RUN_METADATA = /(\/threads\/(?<thread_id>.+))?\/runs\/(?<run_id>.+)/;
+
+function getRunMetadataFromResponse(response) {
+  const contentLocation = response.headers.get("Content-Location");
+  if (!contentLocation) return void 0;
+  const match = REGEX_RUN_METADATA.exec(contentLocation);
+  ...
+  return { run_id: match.groups.run_id, thread_id: match.groups.thread_id || void 0 };
+}
+```
+
+它在**读第一个事件之前**（`onInitialResponse`）就能拿到。
+
+**但 `@ag-ui/langgraph` 没用这条** —— 它等到流里的 metadata 事件才设 `activeRun.id`：
+
+```js
+_.run_id && (this.activeRun.id = _.run_id, this.activeRun.serverRunIdKnown = true, ...)
+```
+
+所以对**这个前端**来说 run_id 确实是随流到的；服务端提供的更早通道没被用上。
+
+这也是取消有**竞态**的原因 —— 用户在 run_id 到达之前点取消，代码会先记下
+`cancelRequested`，等 id 一到立刻发：
+
+```js
+for await (let event of stream) {
+  if (this.cancelRequested && !this.cancelSent
+      && this.activeRun?.threadId && this.activeRun?.id) {
+    await this.client.runs.cancel(this.activeRun.threadId, this.activeRun.id);
+    ...
+    break;
+  }
+  ...
+}
+```
+
+### 隐式路径：断开连接就取消
+
+`super.abortRun()` 会断开 SSE 连接，而服务端默认：
+
+```python
+# runs.py
+cancel_on_disconnect = (request.on_disconnect or "cancel").lower() == "cancel"
+close_handler = _cancel_on_client_close if cancel_on_disconnect else None
+```
+
+`_cancel_on_client_close` → `broker_manager.request_cancel(run_id, "cancel")`。
+
+| 路径 | 靠什么 | 何时 |
+| --- | --- | --- |
+| **显式** | `POST …/runs/{run_id}/cancel` | 前端主动调（知道 run_id 之后） |
+| **隐式** | 断开 SSE 连接 | 默认 `on_disconnect="cancel"` 兜底 |
+
+### 服务端最终怎么停
+
+两条路都汇到同一个 `request_cancel(run_id)`（`broker.py:162`）：
+
+```python
+task = active_runs.get(run_id)
+if task is None or task.done():
+    return
+task.cancel()                                   # ← 真正打断 asyncio task
+await broker.put(event_id, ("end", {"status": "interrupted"}))
+```
+
+`asyncio` 是**协作式取消**，只在 `await` 点生效 —— 所以：
+
+- 异步的 LLM 调用能中断（httpx 请求被 abort）
+- **同步工具跑在线程池里，task 取消后线程还在跑**
+- 纯 CPU 的同步循环不会停
+
+想「硬停」只能靠进程退出。
+
+> 另：`LocalExecutor`（本地开发模式）**没有 run 级超时看门狗** —— `_timeout_cancellations`
+> 只在 `worker_executor.py` 里。所以本地模式下卡死的 run 只能靠手动取消 / 断开连接 / 进程退出。
+> `runs/wait` 的 300 秒超时也不行 —— 它用的是 `asyncio.shield(task)`，只是「不再等」。
 
 ## SSE 是可选的吗
 
