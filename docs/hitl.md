@@ -29,6 +29,18 @@
 > 注意：`docs/error-handling.md` 里的 "v1/v2" 指 LangGraph 的事件生产方式
 > （`astream` vs `astream_events(version="v3")`），和这里的协议代际无关。
 
+官方文档里这套东西的正式叫法是 **Agent Protocol 的 thread-centric streaming
+primitives**，或 LangSmith Deployment 的 **Protocol v2 / Event streaming API**：
+
+- Agent Protocol 规范：<https://langchain-ai.github.io/agent-protocol/>
+  （"Streaming Primitives" 一节，含 HITL input、CDDL schema 与生成的 TS/Python bindings）
+- Event streaming API（v2）：<https://docs.langchain.com/langsmith/event-streaming>
+- Protocol v2 Command 参考：<https://docs.langchain.com/langsmith/agent-server-api/streaming/protocol-v2-command>
+- 旧版 Streaming API（v1，run-scoped）：<https://docs.langchain.com/langsmith/streaming>
+
+规范站点写作 `POST /threads/{id}/stream`，LangSmith 部署文档和本项目实现的是
+`POST /threads/{id}/stream/events`；实现时以部署文档和 SDK 为准。
+
 ## 支持的入口
 
 | 入口 | 位置 | 说明 |
@@ -116,6 +128,137 @@ checkpoint 时才报错。
 - `usecase/streaming/v2/normalizers.py:52-53` —— run 状态 `interrupted` 的
   线上映射。
 
+## 恢复的调用链路（v1 `command.resume`）
+
+以 `POST /threads/{tid}/runs`、body 为
+`{"assistant_id": "shopping_agent", "command": {"resume": true}}` 为例：
+
+```
+POST /threads/{tid}/runs
+  └─ controller/http/routers/runs.py:118  create_run
+      ├─ 线程归属检查 + _apply_create_run_auth
+      └─ _prepare_run(..., initial_status="pending")
+          ├─ _validate_resume_command       ← 必须是 interrupted 线程
+          ├─ 组装 RunJob(command=..., input=None)
+          ├─ INSERT runs + thread.status="busy"
+          └─ executor.submit(job)
+              ├─ 本地模式：create_task(execute_run)
+              └─ Redis 模式：RPUSH → BLPOP → 从 DB 重建 RunJob → execute_run
+  └─ usecase/execution/run_executor.py:41  execute_run
+      ├─ start_run（pending → running）
+      └─ _stream_graph
+          ├─ _build_run_config              ← 强制写入 configurable.thread_id
+          ├─ _resolve_input
+          │     └─ map_command_to_langgraph({"resume": true})
+          │           → Command(resume=True)
+          └─ graph.astream(Command(...), config) / astream_events(v3)
+                └─ LangGraph 按 thread_id 读 checkpoint，恢复中断节点
+```
+
+### 1. HTTP 入口
+
+`create_run`（`routers/runs.py:118`）先确认线程存在且属于当前用户
+（`:131-133`），过认证后交给 `_prepare_run`。它**不会等图跑完**：立即返回
+`pending` 的 run 记录，真正执行在后台。
+
+### 2. 恢复前置校验
+
+`_prepare_run` 第一步调用 `_validate_resume_command`
+（`run_preparation.py:48-75`）。它只看 `command` 里有没有 `resume` 这个 key
+（值可以是 `None`）：
+
+- 线程不存在 → 404
+- `thread.status != "interrupted"` → 用新 session 轮询最多 10 次、每次 100ms，
+  仍不满足 → 400 `Cannot resume: thread is not in interrupted state`
+
+轮询是因为中断事件可能先于上一轮 run 的 `finalize_run` 提交到达客户端。
+
+### 3. 组装 RunJob 并落库
+
+关键字段（`run_preparation.py:314-334`）：
+
+```python
+RunExecution(
+    input_data=request.input,   # 这里为 None
+    command=request.command,    # {"resume": True}
+    ...
+)
+```
+
+随后线程状态置为 `busy`（`:311`），把整个 `RunJob` 序列化进
+`runs.execution_params`（JSONB）并写 run 行（`:348-364`），最后
+`executor.submit(job)`（`:369`）。
+
+### 4. 执行器分发
+
+- **本地模式**（`REDIS_BROKER_ENABLED=false`）：`LocalExecutor.submit` 直接
+  `asyncio.create_task(execute_run(job))`（`local_executor.py:23-36`）。
+- **Redis 模式**：`WorkerExecutor.submit` 把 `run_id` `RPUSH` 到队列
+  （`worker_executor.py:106-113`）；worker 用 `BLPOP` 取出后，从数据库
+  `RunJob.from_run_orm()` 重建 job（`:480`），再 `execute_run(loaded.job)`（`:358`）。
+
+### 5. 组装 LangGraph 输入
+
+`_resolve_input`（`run_executor.py:281-285`）：
+
+```python
+if job.execution.command is not None:
+    return map_command_to_langgraph(job.execution.command)
+return job.execution.input_data
+```
+
+`map_command_to_langgraph`（`run_utils.py:13-29`）把 API 的 dict 转成
+`Command(update=None, goto=None, resume=True)`。
+
+同时 `_build_run_config` 通过 `create_run_config` **强制**写入
+`configurable.thread_id` 和 `configurable.run_id`
+（`langgraph_service.py:699-701`），客户端无法用 config 改写线程归属。
+
+### 6. 真正调用 LangGraph
+
+v1 路径（`graph_streaming.py:296-306`）：
+
+```python
+graph.astream(Command(resume=True), config, stream_mode=[...], ...)
+```
+
+v2 路径（`native_stream.py:77-84`）：
+
+```python
+graph.astream_events(Command(resume=True), config, version="v3", ...)
+```
+
+传给 LangGraph 的**不是普通 input dict，而是 `Command`**。LangGraph 看到
+`Command.resume` 后：
+
+1. 用 `config["configurable"]["thread_id"]` 从 checkpointer 找到上次暂停的 checkpoint；
+2. 定位 pending 的 task/node；
+3. 重新进入该节点，节点里 `interrupt(...)` 的返回值就是 `True`；
+4. 从那里继续执行，而不是从 `START` 重新开始。
+
+对应到 shopping_agent：`tools.py:104` 的 `approved = interrupt(...)` 拿到
+`True`，随后执行 `backend.checkout_handoff()`。
+
+### 7. 结果与状态回写
+
+`_stream_graph` 把事件逐条放进 broker 供 SSE 消费，同时检测中断：
+
+- v1：事件 dict 里有 `__interrupt__` → `has_interrupt = True`
+  （`run_executor.py:223-226`）
+- v2：`params.interrupts` 或 `__interrupt__` → 同上（`:253-260`）
+
+结束后（`run_executor.py:60-77`）：
+
+```python
+if final_output.has_interrupt:
+    finalize_run(status="interrupted", thread_status="interrupted")
+else:
+    finalize_run(status="success", thread_status="idle")
+```
+
+即：恢复并跑完 → run `success`、thread `idle`；图再次暂停 → 两者再次
+`interrupted`，可以继续恢复。
+
 ## 图作者视角
 
 图里只需要一个 `interrupt()` 调用，返回值就是客户端提交的决议：
@@ -143,6 +286,77 @@ if not approved:
 - `apps/web/components/CheckoutApproval.tsx` —— 聊天内渲染的审批卡片
   （Approve / Cancel）。
 - `apps/web/app/page.tsx:99` —— 收到 interrupt 后渲染该卡片并回写决议。
+
+## 实操：在 Demo 页面触发 HITL
+
+`apps/web` 首页默认是 `shopping_agent`（Customer 标签），最短路径是
+**加购 → 结账**：
+
+1. 启动：
+
+   ```bash
+   make dev                    # 服务端 :2026
+   cd apps/web && npm run dev  # 首页 :3000
+   ```
+
+   确认 `.env` 里的模型 key 可用。
+
+2. 打开 <http://localhost:3000>，默认进入 **Customer**（`providers.tsx:14`），
+   右侧 CopilotSidebar 就是对 `shopping_agent` 的对话入口。
+
+3. 先加购，例如：
+
+   > Find a coffee maker under $100 and add it to my cart.
+
+4. 再明确说结账：
+
+   > Check out my cart. / 把购物车结账。
+
+   模型调用 `checkout` 工具后，`shopping_agent/tools.py:104` 的
+   `interrupt({"type": "checkout_approval", ...})` 会让图暂停。
+
+5. 页面弹出审批卡片（`page.tsx:98-116` 的 `CheckoutInterrupt` 用
+   `useInterrupt` 监听，渲染 `components/CheckoutApproval.tsx`）：
+   - **Approve** → `resolve(true)`，图继续执行，返回 handoff URL（不会真的下单）
+   - **Cancel** → `cancel()`，购物车保持不变
+
+### 常见「没触发」的原因
+
+- **购物车是空的**：`checkout` 在空车时直接返回 `empty_cart` blocked，不会走到
+  `interrupt`（`tools.py:101-102`）。必须先 `add_to_cart`。
+- **模型没调用 `checkout`**：工具调用由 LLM 决定，明确说 "check out" / "结账" 最稳。
+- **切到了 Merchant 标签**：`merchant_agent.apply_change` 也会 interrupt，但页面里的
+  `CheckoutInterrupt` 硬编码了 `agentId: "shopping_agent"`，所以 merchant 的中断
+  没有对应审批卡片。
+
+### 不经 UI 的确定性触发
+
+直接走协议一定能命中：
+
+```bash
+# 1. 建 thread
+TID=$(curl -s -X POST localhost:2026/threads \
+  -H 'Content-Type: application/json' -d '{}' | jq -r .thread_id)
+
+# 2. 发起一个"加购并结账"的 run
+curl -s -X POST localhost:2026/threads/$TID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"assistant_id":"shopping_agent","input":{"messages":[{"role":"user","content":"Find a coffee maker under $100, add the cheapest to my cart, then check out."}]}}'
+
+# 3. 此时 run/thread 变为 interrupted，interrupt 载荷在 state 里
+curl -s localhost:2026/threads/$TID/state | jq '.tasks'
+
+# 4. 批准恢复
+curl -s -X POST localhost:2026/threads/$TID/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"assistant_id":"shopping_agent","command":{"resume":true}}'
+```
+
+v2 事件流同理：订阅 `POST /threads/{id}/stream/events`，收到
+`input.requested` 后发 `POST /threads/{id}/commands`，body 为
+`{"id":1,"method":"input.respond","params":{"interrupt_id":"...","response":true}}`。
+
+开发模式默认免认证；如果开了 auth，需要按 `auth/` 的配置带上用户 header。
 
 ## 测试覆盖
 
