@@ -41,3 +41,4 @@
 | 12 | [SSE 是可选的吗](12-sse-optional.md) | 非流式端点可绕开，但 Pregel 的流绕不开 |
 | 13 | [客户端：自己解析 SSE，不用 EventSource](13-client-sse-parsing.md) | getReader 逐块读、按空行切事件 |
 | 14 | [坑](14-pitfalls.md) | 六个坑，含 web_search 是模拟的 |
+| 15 | [broker 并发模型](15-broker-concurrency.md) | `backlog` 快照的原子性、线程/多进程边界 |

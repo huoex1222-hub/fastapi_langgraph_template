@@ -88,6 +88,9 @@ for ... backlog: yield ...
 
 这样「补发」和「实时」之间的窗口里产生的事件会落进队列，不丢；重叠部分靠 `event_id` 去重。
 
+> 这段「先注册、再快照」只在 asyncio 单事件循环下成立，跨线程/多进程的边界见
+> [broker 并发模型](15-broker-concurrency.md)。
+
 Redis 模式下结构变了、语义没变：
 
 | | 内存（`RunBroker`） | Redis（`RedisRunBroker`） |
