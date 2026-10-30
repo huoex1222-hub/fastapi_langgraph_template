@@ -116,6 +116,38 @@ Store 的隔离与检索：
   可以按用户属性共享给同一组织。
 - 语义检索可选：`store.index` 配置（`repo/database.py:83-95`）。
 
+### Store 从哪来：实例创建与注入链路
+
+`runtime.store` 不是图或节点创建的，全进程只有一个实例，由框架在每次取图时注入：
+
+```
+db_manager.initialize()                         # app/main.py:132（lifespan）
+  └─ AsyncPostgresStore(conn=lg_pool, index=…)  # repo/database.py:87，与 checkpointer 共用 psycopg 池
+       └─ db_manager.get_store()                # repo/database.py:121
+            └─ langgraph_service.get_graph()    # repo/graphs/langgraph_service.py:332-333
+                 ├─ build_server_runtime(store=…)              # 通道 1：工厂图的 ServerRuntime
+                 └─ graph.copy(update={"store": store})        # 通道 2：编译后的 Pregel
+```
+
+| 通道 | 代码 | 给谁用 |
+| --- | --- | --- |
+| **1. 工厂 `ServerRuntime.store`** | `langgraph_service.py:354-359` → `graph_factory.py:373-384` | `def graph(runtime: ServerRuntime[T])` 这类**图工厂**在构图期读 store |
+| **2. Pregel 的 store** | factory 图 `langgraph_service.py:368-369`；静态图 `:392-399` | **节点里的 `runtime.store`**——LangGraph 执行时把 Pregel 的 store 放进节点 Runtime |
+
+`shopping_agent` 是静态图（`graph.py:10` 直接 `.compile()`），走通道 2；节点在
+`nodes.py:30/169` 把它包成 `MemoryStore`，工具在 `tools.py:122-125` 通过 `ctx.store` 拿。
+
+两个需要注意的边界：
+
+- **只有执行/读取路径保证 store 非空**。`get_graph_for_validation()`（`langgraph_service.py:444`）和
+  加载期默认工厂调用（`:564`）都传 `store=None`，所以 `build_server_runtime` 里对 store 的
+  `cast` 注释才写着"initialized before execution-time runtimes are built"（`graph_factory.py:377`）。
+- **协议 HTTP 的 `/store/*` 不经过图**：路由直接 `db_manager.get_store()`
+  （`controller/http/routers/store.py:57,93,142,175,227`）。
+
+**How to find it：** grep `get_store` / `build_server_runtime` / `update={"checkpointer"`；
+只搜 `runtime.store` 只能找到消费方（节点、工具），找不到注入方。
+
 ## 4. 运行上下文：`Runtime[Context]`
 
 `Context` 是每次 run 的不可变配置，典型定义：
@@ -236,7 +268,8 @@ src/graphs/research_agent/agent.py:96-107      create_deep_agent（含摘要中�
 src/graphs/shared/memory.py:69-113             MemoryStore（过滤 + retention）
 src/graphs/shared/middleware/skill_router.py   top-k 技能选择
 src/agent_server/repo/database.py:78-95        Checkpointer / Store 初始化
-src/agent_server/repo/graphs/langgraph_service.py:294-407  每请求注入 checkpointer/store
+src/agent_server/repo/database.py:121-125      db_manager.get_store()
+src/agent_server/repo/graphs/langgraph_service.py:294-407  每请求注入 checkpointer/store（store 在 :332-333、:368-369、:392-399）
 src/agent_server/repo/graphs/langgraph_service.py:640-665  inject_user_context
 src/agent_server/repo/graphs/langgraph_service.py:680-730  create_run_config（thread_id 钉死）
 src/agent_server/repo/graphs/graph_factory.py:284-322      coerce_context
