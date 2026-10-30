@@ -11,6 +11,9 @@
 `src/shop`、`src/ml` 没有数据库表：它们是 demo 用的内存实现
 （`src/shop/backends.py:99` 的 `FakeShopBackend`），不落库。
 
+> 连接池、Session 生命周期、`Depends(get_session)` 的借还时机见
+> [数据库连接池与 Session 生命周期](database-session-pooling.md)。
+
 ## 总览
 
 | 表 | 归属 | 一句话设计意图 |

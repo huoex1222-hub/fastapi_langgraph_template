@@ -96,6 +96,9 @@ thread_ttl_sweeper.start()
         ↓ yield
 ```
 
+`db_manager.initialize()` 建的两个池、Session 与连接的借还时机，见
+[数据库连接池与 Session 生命周期](database-session-pooling.md)。
+
 executor 的选择是**导入期**就定死的（`usecase/execution/executor.py:17-29`，模块级
 `executor: BaseExecutor = _create_executor()`）。
 
